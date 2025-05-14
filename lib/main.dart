@@ -14,6 +14,8 @@ import 'settings_screen.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:glassmorphism/glassmorphism.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:flutter/services.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -104,6 +106,9 @@ class _RecorderScreenState extends State<RecorderScreen>
   String _whisperApiKey = '';
   String _discordWebhookUrl = '';
 
+  // 共有インテント処理用
+  StreamSubscription? _intentDataStreamSubscription;
+
   @override
   void initState() {
     super.initState();
@@ -121,6 +126,9 @@ class _RecorderScreenState extends State<RecorderScreen>
     );
 
     _animationController.repeat(reverse: true);
+
+    // 起動処理（ショートカット検出と共有リスナー初期化を含む）
+    _checkForShortcutLaunch();
   }
 
   Future<void> _loadSettings() async {
@@ -177,6 +185,125 @@ class _RecorderScreenState extends State<RecorderScreen>
     } catch (e) {
       setState(() {
         _status = 'レコーダー初期化エラー: $e';
+      });
+    }
+  }
+
+  void _initSharedContentListener() {
+    try {
+      print("共有リスナーを初期化中...");
+
+      // 共有完了後にリセット（先にリセットしておく）
+      try {
+        ReceiveSharingIntent.instance.reset();
+      } catch (e) {
+        print("リセットエラー: $e");
+      }
+
+      // アプリ起動中に共有を受け取った場合
+      _intentDataStreamSubscription = ReceiveSharingIntent.instance
+          .getMediaStream()
+          .listen(
+            (List<SharedMediaFile> value) {
+              print("共有されたメディア数: ${value.length}");
+              if (value.isNotEmpty) {
+                final String path = value.first.path;
+                print("共有されたメディアパス: $path");
+                if (path.endsWith('.mp3') ||
+                    path.endsWith('.mp4') ||
+                    path.endsWith('.m4a') ||
+                    path.endsWith('.wav') ||
+                    path.endsWith('.aac')) {
+                  _processSharedAudio(path);
+                } else {
+                  setState(() {
+                    _status = '非対応のファイル形式です: $path';
+                  });
+                }
+              }
+            },
+            onError: (err) {
+              print("共有エラー: $err");
+              setState(() {
+                _status = '共有エラー: $err';
+              });
+            },
+          );
+
+      // アプリが閉じられた状態から起動された場合は慎重に処理
+      try {
+        ReceiveSharingIntent.instance.getInitialMedia().then(
+          (List<SharedMediaFile> value) {
+            print("初期共有メディア数: ${value.length}");
+            if (value.isNotEmpty) {
+              final String path = value.first.path;
+              print("初期共有メディアパス: $path");
+              if (path.endsWith('.mp3') ||
+                  path.endsWith('.mp4') ||
+                  path.endsWith('.m4a') ||
+                  path.endsWith('.wav') ||
+                  path.endsWith('.aac')) {
+                _processSharedAudio(path);
+              } else {
+                setState(() {
+                  _status = '非対応のファイル形式です: $path';
+                });
+              }
+            }
+          },
+          onError: (error) {
+            print("初期共有メディア取得エラー: $error");
+          },
+        );
+      } catch (e) {
+        print("初期共有メディア処理エラー: $e");
+      }
+    } catch (e) {
+      print("共有リスナー初期化エラー: $e");
+    }
+  }
+
+  Future<void> _processSharedAudio(String filePath) async {
+    print("共有された音声ファイルを処理: $filePath");
+
+    if (_whisperApiKey.isEmpty || _discordWebhookUrl.isEmpty) {
+      print("APIキーまたはWebhook URLが設定されていません");
+      _navigateToSettings();
+      return;
+    }
+
+    setState(() {
+      _isProcessing = true;
+      _status = '共有された音声を処理中...';
+      _recordingPath = filePath; // 共有されたファイルを使用
+    });
+
+    // 音声ファイルの確認
+    final audioFile = File(filePath);
+    if (await audioFile.exists()) {
+      final fileSize = await audioFile.length();
+      print("共有されたファイルサイズ: ${fileSize / 1024} KB");
+
+      if (fileSize < 20000) {
+        setState(() {
+          _status = 'ファイルが小さすぎます（$fileSize バイト）';
+          _isProcessing = false;
+        });
+        return;
+      }
+
+      setState(() {
+        _status =
+            '共有された音声ファイルを処理中...（サイズ: ${(fileSize / 1024).toStringAsFixed(2)} KB）';
+      });
+
+      // 既存の音声認識処理を呼び出し
+      await _transcribeAudio();
+    } else {
+      print("共有されたファイルが存在しません: $filePath");
+      setState(() {
+        _status = '共有されたファイルが見つかりません: $filePath';
+        _isProcessing = false;
       });
     }
   }
@@ -244,8 +371,9 @@ class _RecorderScreenState extends State<RecorderScreen>
     final audioFile = File(_recordingPath);
     if (await audioFile.exists()) {
       final fileSize = await audioFile.length();
-      if (fileSize < 8000) {
-        // 約1秒未満と思われる短い録音
+      // 録音ファイルのサイズチェック - 閾値を上げて短すぎる録音を排除
+      if (fileSize < 20000) {
+        // 約2-3秒未満と思われる短い録音
         setState(() {
           _status = '録音が短すぎます（$fileSize バイト）。もう少し長く話してください';
           _isProcessing = false;
@@ -323,6 +451,21 @@ class _RecorderScreenState extends State<RecorderScreen>
         final jsonResponse = json.decode(responseBody);
         final transcription = jsonResponse['text'] as String;
 
+        // 認識結果の信頼性チェック
+        if (transcription.isEmpty ||
+            transcription.contains('ご視聴ありがとうございました') ||
+            transcription.contains('チャンネル登録') ||
+            transcription.contains('高評価') ||
+            transcription.contains('お願いします') ||
+            transcription.contains('ご覧いただき') ||
+            transcription.length < 3) {
+          setState(() {
+            _status = '音声認識に失敗しました。もう一度お試しください。';
+            _isProcessing = false;
+          });
+          return;
+        }
+
         setState(() {
           _recognizedText = transcription;
           _status =
@@ -395,8 +538,52 @@ class _RecorderScreenState extends State<RecorderScreen>
     await _loadSettings();
   }
 
+  // ショートカットから起動されたかチェック
+  Future<void> _checkForShortcutLaunch() async {
+    bool launchedFromShortcut = false;
+
+    try {
+      const platform = MethodChannel('com.example.whiscord/shortcuts');
+      final String? action = await platform.invokeMethod<String>(
+        'getShortcutAction',
+      );
+
+      if (action != null && action.isNotEmpty) {
+        print('ショートカットから起動: $action');
+        launchedFromShortcut = true;
+
+        if (action == 'record') {
+          // 短い遅延を入れて、UIが完全に読み込まれた後に録音を開始
+          Future.delayed(const Duration(milliseconds: 500), () {
+            _startRecording();
+          });
+        } else if (action == 'settings') {
+          // 設定画面を開く
+          Future.delayed(const Duration(milliseconds: 500), () {
+            _navigateToSettings();
+          });
+        }
+      }
+    } catch (e) {
+      print('ショートカット処理エラー: $e');
+    }
+
+    // ショートカットから起動された場合と通常起動の場合で処理を分ける
+    if (launchedFromShortcut) {
+      // ショートカットから起動された場合はすぐに共有リスナーを初期化しない
+      // （必要に応じて後でユーザーアクションに対応して初期化する）
+      print('ショートカットから起動されたため、共有リスナーは初期化しません');
+    } else {
+      // 通常起動の場合は500ms後に共有リスナーを初期化
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _initSharedContentListener();
+      });
+    }
+  }
+
   @override
   void dispose() {
+    _intentDataStreamSubscription?.cancel();
     _animationController.dispose();
     _recorder.closeRecorder();
     super.dispose();

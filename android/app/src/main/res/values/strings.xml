@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Whiscord</string>
+    <string name="shortcut_record_short">録音</string>
+    <string name="shortcut_record_long">音声を録音して送信</string>
+    <string name="shortcut_settings_short">設定</string>
+    <string name="shortcut_settings_long">アプリ設定</string>
+</resources> 

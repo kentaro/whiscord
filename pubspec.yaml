@@ -58,6 +58,9 @@ dependencies:
   google_fonts: ^6.1.0
   flutter_animate: ^4.5.2
   glassmorphism: ^3.0.0
+  
+  # コンテンツ共有機能
+  receive_sharing_intent: ^1.4.5
 
 dev_dependencies:
   flutter_test:
